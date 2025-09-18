@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -190,6 +191,155 @@ func TestFileReadAt(t *testing.T) {
 	}
 
 	assert.EqualValues(t, testStr3, string(buf))
+}
+
+func TestFileReadAtConcurrent(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/mobydick.txt")
+	require.NoError(t, err)
+	defer file.Close()
+
+	data, err := os.ReadFile("testdata/mobydick.txt")
+	require.NoError(t, err)
+
+	const (
+		goroutines = 8
+		requests   = 200
+		maxLength  = 4096
+	)
+
+	type request struct {
+		offset int64
+		length int
+	}
+
+	reqs := make([]request, requests)
+	r := rand.New(rand.NewSource(1234))
+	for i := range reqs {
+		off := int64(r.Intn(len(data)))
+		length := r.Intn(maxLength) + 1
+		if int(off)+length > len(data) {
+			length = len(data) - int(off)
+		}
+		if length == 0 {
+			length = 1
+			off = int64(len(data) - 1)
+		}
+
+		reqs[i] = request{offset: off, length: length}
+	}
+
+	errCh := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for i := idx; i < len(reqs); i += goroutines {
+				req := reqs[i]
+				buf := make([]byte, req.length)
+				n, err := file.ReadAt(buf, req.offset)
+				if err != nil {
+					errCh <- fmt.Errorf("readat offset %d length %d: %w", req.offset, req.length, err)
+					return
+				}
+				if n != req.length {
+					errCh <- fmt.Errorf("readat offset %d length %d read %d", req.offset, req.length, n)
+					return
+				}
+
+				start := int(req.offset)
+				expected := data[start : start+req.length]
+				if !bytes.Equal(buf, expected) {
+					errCh <- fmt.Errorf("unexpected data at offset %d", req.offset)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+}
+
+func TestFileReadAtDoesNotAffectOffset(t *testing.T) {
+	client := getClient(t)
+
+	file, err := client.Open("/_test/mobydick.txt")
+	require.NoError(t, err)
+	defer file.Close()
+
+	_, err = file.Seek(testStrOff, io.SeekStart)
+	require.NoError(t, err)
+
+	buf := make([]byte, len(testStr))
+	n, err := io.ReadFull(file, buf)
+	require.NoError(t, err)
+	require.Equal(t, len(buf), n)
+	require.Equal(t, testStr, string(buf))
+
+	offsetBefore := file.offset
+	blockReaderBefore := file.blockReader
+
+	readAtBuf := make([]byte, len(testStr2))
+	n, err = file.ReadAt(readAtBuf, int64(testStr2Off))
+	require.NoError(t, err)
+	require.Equal(t, len(readAtBuf), n)
+	require.Equal(t, testStr2, string(readAtBuf))
+
+	assert.Equal(t, offsetBefore, file.offset)
+	assert.Equal(t, blockReaderBefore, file.blockReader)
+
+	nextBuf := make([]byte, len(testStr))
+	n, err = io.ReadFull(file, nextBuf)
+	require.NoError(t, err)
+	require.Equal(t, len(nextBuf), n)
+
+	moby, err := os.ReadFile("testdata/mobydick.txt")
+	require.NoError(t, err)
+	expected := moby[int(offsetBefore) : int(offsetBefore)+len(nextBuf)]
+	assert.Equal(t, expected, nextBuf)
+}
+
+func TestFileReadAtCrossesBlockBoundary(t *testing.T) {
+	client := getClient(t)
+
+	path := "/_test/readat-block-boundary.txt"
+	baleet(t, path)
+	defer baleet(t, path)
+
+	writer, err := client.CreateFile(path, 1, 512, 0644)
+	require.NoError(t, err)
+
+	data := make([]byte, 2048)
+	for i := range data {
+		data[i] = byte('a' + (i % 26))
+	}
+
+	n, err := writer.Write(data)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.NoError(t, writer.Close())
+
+	file, err := client.Open(path)
+	require.NoError(t, err)
+	defer file.Close()
+
+	const (
+		readOffset = 400
+		readLength = 800
+	)
+
+	buf := make([]byte, readLength)
+	n, err = file.ReadAt(buf, readOffset)
+	require.NoError(t, err)
+	require.Equal(t, readLength, n)
+	assert.Equal(t, data[readOffset:readOffset+readLength], buf)
 }
 
 func TestFileReadAtEOF(t *testing.T) {
