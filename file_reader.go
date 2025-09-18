@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	hdfs "github.com/colinmarc/hdfs/v2/internal/protocol/hadoop_hdfs"
@@ -22,8 +23,11 @@ type FileReader struct {
 	info   os.FileInfo
 
 	blocks      []*hdfs.LocatedBlockProto
+	blocksOnce  sync.Once
+	blocksErr   error
 	blockReader *transfer.BlockReader
 	deadline    time.Time
+	deadlineMu  sync.RWMutex
 	offset      int64
 
 	readdirLast string
@@ -59,13 +63,23 @@ func (f *FileReader) Stat() os.FileInfo {
 // SetDeadline sets the deadline for future Read, ReadAt, and Checksum calls. A
 // zero value for t means those calls will not time out.
 func (f *FileReader) SetDeadline(t time.Time) error {
+	f.deadlineMu.Lock()
 	f.deadline = t
+	f.deadlineMu.Unlock()
+
 	if f.blockReader != nil {
 		return f.blockReader.SetDeadline(t)
 	}
 
 	// Return the error at connection time.
 	return nil
+}
+
+func (f *FileReader) getDeadline() time.Time {
+	f.deadlineMu.RLock()
+	defer f.deadlineMu.RUnlock()
+
+	return f.deadline
 }
 
 // Checksum returns HDFS's internal "MD5MD5CRC32C" checksum for a given file.
@@ -82,12 +96,11 @@ func (f *FileReader) Checksum() ([]byte, error) {
 		}
 	}
 
-	if f.blocks == nil {
-		err := f.getBlocks()
-		if err != nil {
-			return nil, err
-		}
+	if err := f.ensureBlocks(); err != nil {
+		return nil, err
 	}
+
+	deadline := f.getDeadline()
 
 	// Hadoop calculates this by writing the checksums out to a byte array, which
 	// is automatically padded with zeroes out to the next  power of 2
@@ -111,7 +124,7 @@ func (f *FileReader) Checksum() ([]byte, error) {
 			DialFunc:            d,
 		}
 
-		err = cr.SetDeadline(f.deadline)
+		err = cr.SetDeadline(deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -195,11 +208,8 @@ func (f *FileReader) Read(b []byte) (int, error) {
 		return 0, nil
 	}
 
-	if f.blocks == nil {
-		err := f.getBlocks()
-		if err != nil {
-			return 0, err
-		}
+	if err := f.ensureBlocks(); err != nil {
+		return 0, err
 	}
 
 	for {
@@ -239,20 +249,79 @@ func (f *FileReader) ReadAt(b []byte, off int64) (int, error) {
 		return 0, &os.PathError{"readat", f.name, errors.New("negative offset")}
 	}
 
-	_, err := f.Seek(off, 0)
-	if err != nil {
+	if off > f.info.Size() {
+		return 0, fmt.Errorf("invalid resulting offset: %d", off)
+	}
+
+	if len(b) == 0 {
+		return 0, nil
+	}
+
+	if f.info.IsDir() {
+		return 0, &os.PathError{"read", f.name, errors.New("is a directory")}
+	}
+
+	if err := f.ensureBlocks(); err != nil {
 		return 0, err
 	}
 
-	n, err := io.ReadFull(f, b)
+	deadline := f.getDeadline()
+	fileSize := f.info.Size()
+	remaining := b
+	total := 0
+	currentOffset := off
 
-	// For some reason, os.File.ReadAt returns io.EOF in this case instead of
-	// io.ErrUnexpectedEOF.
-	if err == io.ErrUnexpectedEOF {
-		err = io.EOF
+	for len(remaining) > 0 && currentOffset < fileSize {
+		block, err := f.blockForOffset(currentOffset)
+		if err != nil {
+			return total, err
+		}
+
+		start := int64(block.GetOffset())
+		blockOffset := currentOffset - start
+		blockLength := int64(block.GetB().GetNumBytes())
+		if blockOffset < 0 || blockOffset >= blockLength {
+			return total, errors.New("invalid block offset")
+		}
+
+		blockRemaining := blockLength - blockOffset
+		toRead := len(remaining)
+		if int64(toRead) > blockRemaining {
+			toRead = int(blockRemaining)
+		}
+
+		br, err := f.newBlockReaderAt(block, blockOffset, deadline)
+		if err != nil {
+			return total, err
+		}
+
+		n, readErr := io.ReadFull(br, remaining[:toRead])
+		if closeErr := br.Close(); readErr == nil && closeErr != nil {
+			readErr = closeErr
+		}
+
+		total += n
+		currentOffset += int64(n)
+		remaining = remaining[n:]
+
+		if readErr != nil {
+			if readErr == io.ErrUnexpectedEOF {
+				readErr = io.EOF
+			}
+
+			if readErr == io.EOF {
+				return total, readErr
+			}
+
+			return total, readErr
+		}
 	}
 
-	return n, err
+	if len(remaining) > 0 {
+		return total, io.EOF
+	}
+
+	return total, nil
 }
 
 // Readdir reads the contents of the directory associated with file and returns
@@ -391,7 +460,19 @@ func (f *FileReader) Close() error {
 	return nil
 }
 
+func (f *FileReader) ensureBlocks() error {
+	f.blocksOnce.Do(func() {
+		f.blocksErr = f.fetchBlocks()
+	})
+
+	return f.blocksErr
+}
+
 func (f *FileReader) getBlocks() error {
+	return f.ensureBlocks()
+}
+
+func (f *FileReader) fetchBlocks() error {
 	req := &hdfs.GetBlockLocationsRequestProto{
 		Src:    proto.String(f.name),
 		Offset: proto.Uint64(0),
@@ -401,6 +482,7 @@ func (f *FileReader) getBlocks() error {
 
 	err := f.client.namenode.Execute("getBlockLocations", req, resp)
 	if err != nil {
+		f.blocks = nil
 		return err
 	}
 
@@ -409,6 +491,10 @@ func (f *FileReader) getBlocks() error {
 }
 
 func (f *FileReader) getNewBlockReader() error {
+	if err := f.ensureBlocks(); err != nil {
+		return err
+	}
+
 	off := uint64(f.offset)
 	for _, block := range f.blocks {
 		start := block.GetOffset()
@@ -430,9 +516,46 @@ func (f *FileReader) getNewBlockReader() error {
 				DialFunc:            dialFunc,
 			}
 
-			return f.SetDeadline(f.deadline)
+			deadline := f.getDeadline()
+			return f.blockReader.SetDeadline(deadline)
 		}
 	}
 
 	return errors.New("invalid offset")
+}
+
+func (f *FileReader) blockForOffset(off int64) (*hdfs.LocatedBlockProto, error) {
+	for _, block := range f.blocks {
+		start := int64(block.GetOffset())
+		length := int64(block.GetB().GetNumBytes())
+		if start <= off && off < start+length {
+			return block, nil
+		}
+	}
+
+	return nil, errors.New("invalid offset")
+}
+
+func (f *FileReader) newBlockReaderAt(block *hdfs.LocatedBlockProto, blockOffset int64, deadline time.Time) (*transfer.BlockReader, error) {
+	dialFunc, err := f.client.wrapDatanodeDial(
+		f.client.options.DatanodeDialFunc,
+		block.GetBlockToken())
+	if err != nil {
+		return nil, err
+	}
+
+	br := &transfer.BlockReader{
+		ClientName:          f.client.namenode.ClientName,
+		Block:               block,
+		Offset:              blockOffset,
+		UseDatanodeHostname: f.client.options.UseDatanodeHostname,
+		DialFunc:            dialFunc,
+	}
+
+	if err := br.SetDeadline(deadline); err != nil {
+		br.Close()
+		return nil, err
+	}
+
+	return br, nil
 }
